@@ -1,0 +1,14 @@
+[Unit]
+Description=Caliptra MCU bridge agent (USB gadget serial <-> FPGA registers)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/vck190_agent.py --port /dev/ttyGS0
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/vck190_agent.log
+StandardError=append:/var/log/vck190_agent.log
+
+[Install]
+WantedBy=multi-user.target
