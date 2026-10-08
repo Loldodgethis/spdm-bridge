@@ -3,6 +3,7 @@ Description=Caliptra MCU bridge agent (USB gadget serial <-> FPGA registers)
 After=multi-user.target
 
 [Service]
+Environment=HOME=/root
 Type=simple
 ExecStart=/usr/bin/python3 /root/vck190_agent.py --port /dev/ttyGS0
 Restart=always

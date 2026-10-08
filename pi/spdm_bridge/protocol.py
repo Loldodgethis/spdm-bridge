@@ -385,7 +385,7 @@ def req_get_version() -> bytes:
     return bytes([0x00, 0x00])
 
 
-def req_get_capabilities(data_transfer: int = 1024, max_msg: int = 4096) -> bytes:
+def req_get_capabilities(data_transfer: int = 1024, max_msg: int = 1024) -> bytes:
     """1.1+ body: reserved, CTExponent, reserved x2, flags, then sizes."""
     return (bytes([0x00, 0x00, 0x00, 0x0C, 0x00, 0x00])
             + (0).to_bytes(4, "little")
@@ -394,21 +394,28 @@ def req_get_capabilities(data_transfer: int = 1024, max_msg: int = 4096) -> byte
 
 
 def req_negotiate_algorithms() -> bytes:
-    """Minimal NEGOTIATE_ALGORITHMS: SHA-384 hash, ECDSA P-384 signature.
+    """NEGOTIATE_ALGORITHMS, 30-byte fixed prefix, no AlgStruct entries.
 
-    param1 = 0 ext algorithm structures, Length covers the whole message.
+    Layout from the responder's NegotiateAlgorithmsReqBodyFixed:
+        num_alg_struct, param2, length(2), measurement_spec,
+        other_param_support, base_asym_algo(4), base_hash_algo(4),
+        pqc_asym_algo(4), reserved1[8], ext_asym_count, ext_hash_count,
+        reserved2, mel_spec. SIZE = 30.
+
+    length counts the whole request including the 2-byte SPDM header,
+    so 2 + 30 = 32 with no AlgStruct entries.
     """
     body = bytearray()
-    body += bytes([0x00, 0x00])            # param1 (0 alg structs), param2
-    body += (32).to_bytes(2, "little")     # Length of this message
-    body += bytes([0x01])                  # MeasurementSpecification: DMTF
-    body += bytes([0x00])                  # OtherParamsSupport
-    body += (0x0000_0080).to_bytes(4, "little")   # BaseAsymAlgo: ECDSA P-384
-    body += (0x0000_0002).to_bytes(4, "little")   # BaseHashAlgo: SHA-384
-    body += bytes(12)                      # reserved
-    body += bytes([0x00])                  # ExtAsymCount
-    body += bytes([0x00])                  # ExtHashCount
-    body += bytes([0x00, 0x00])            # reserved
+    body += bytes([0x00, 0x00])                    # num_alg_struct, param2
+    body += (32).to_bytes(2, "little")             # length incl. SPDM header
+    body += bytes([0x01])                          # measurement_spec: DMTF
+    body += bytes([0x00])                          # other_param_support
+    body += (0x0000_0080).to_bytes(4, "little")    # base_asym: ECDSA P-384
+    body += (0x0000_0002).to_bytes(4, "little")    # base_hash: SHA-384
+    body += (0).to_bytes(4, "little")              # pqc_asym_algo
+    body += bytes(8)                               # reserved1
+    body += bytes([0x00, 0x00])                    # ext_asym, ext_hash counts
+    body += bytes([0x00, 0x00])                    # reserved2, mel_spec
     return bytes(body)
 
 

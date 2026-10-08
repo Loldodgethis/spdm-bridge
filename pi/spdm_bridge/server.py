@@ -196,6 +196,25 @@ poll(); setInterval(poll,400);
 </script></body></html>"""
 
 
+#: Which builder makes a correct body for each request code. Sending the
+#: 1.0 two-byte body to a 1.3 responder gets ERROR 0x01 back.
+def _request_body(code: int) -> bytes:
+    builders = {
+        0x84: protocol.req_get_version,
+        0xE1: protocol.req_get_capabilities,
+        0xE3: protocol.req_negotiate_algorithms,
+        0x81: protocol.req_get_digests,
+        0x82: protocol.req_get_certificate,
+        0x83: protocol.req_challenge,
+        0xE0: protocol.req_get_measurements,
+    }
+    fn = builders.get(code)
+    return fn() if fn else b"\x00\x00"
+
+
+REQUEST_BODIES = _request_body
+
+
 def make_handler(bridge: Bridge):
     subscribers: "list[queue.Queue]" = []
     lock = threading.Lock()
@@ -283,8 +302,15 @@ def make_handler(bridge: Bridge):
                 if "hex" in body:
                     data = bytes.fromhex(body["hex"].replace(" ", ""))
                 elif "code" in body:
-                    payload = bytes.fromhex(body.get("payload", "0000"))
-                    ver = body.get("version", bridge.negotiated_version)
+                    code_i = int(body["code"])
+                    payload = (bytes.fromhex(body["payload"])
+                               if "payload" in body
+                               else _request_body(code_i))
+                    # GET_VERSION is the discovery message: it must go
+                    # out at 1.0 or the responder answers VersionMismatch.
+                    ver = body.get("version",
+                                   0x10 if int(body["code"]) == 0x84
+                                   else bridge.negotiated_version)
                     if getattr(bridge, "raw_frames", False):
                         data = protocol.build_frame_raw(
                             int(body["code"]), payload, spdm_version=ver)
@@ -320,18 +346,73 @@ def make_handler(bridge: Bridge):
                                         kind="info")
                             bridge.wait_for(target, "!DOWN", 90)
                             bridge.control(target, "!BOOT")
-                        if not bridge.wait_for(target, "!READY", 150):
+                        if not bridge.wait_for(target, "!READY", 1200):
                             bridge.note("firmware did not come up in time",
                                         kind="error")
                             return
 
-                    bridge.send(target, (protocol.canned_request_stream_raw() if getattr(bridge, 'raw_frames', False) else protocol.canned_request_stream()))
+                    # reuse the negotiated path: GET_VERSION at 1.0, wait for
+                    # the version table, then the rest at what was offered
+                    import urllib.request as _u, json as _j
+                    _u.urlopen(_u.Request(
+                        "http://127.0.0.1:8080/api/sequence",
+                        data=_j.dumps({"target": target}).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST"))
 
                 threading.Thread(target=boot_and_run, daemon=True).start()
                 self._send(200, b'{"ok":true}')
             elif url.path == "/api/attest":
+                def probe_version() -> bool:
+                    """Ask GET_VERSION ourselves instead of using !STATUS.
+
+                    !STATUS makes the agent send its own GET_VERSION on the
+                    same wire, so the responder sees two requests and the
+                    replies interleave with the agent's control lines. The
+                    flow starts with GET_VERSION anyway, so it is its own
+                    liveness check.
+                    """
+                    build = (protocol.build_frame_raw
+                             if getattr(bridge, "raw_frames", False)
+                             else protocol.build_frame)
+                    bridge.send(target, build(0x84, protocol.req_get_version(),
+                                              spdm_version=0x10))
+                    rsp = bridge.wait_response(0x04, timeout=12)
+                    return rsp is not None and rsp.spdm_code == 0x04
+
+                def ensure_firmware() -> bool:
+                    """Make sure an MCU is listening, booting one if not."""
+                    import time as _t
+
+                    if probe_version():
+                        bridge._version_probed = True
+                        return True
+                    bridge._version_probed = False
+
+                    bridge.note("no firmware running - booting, "
+                                "this takes 10-20 minutes")
+                    bridge.control(target, "!BOOT")
+                    _t.sleep(1)
+                    if bridge.last_control.get(target) == "!BUSY":
+                        bridge.note("a test is already running - waiting for it")
+                        bridge.wait_for(target, "!DOWN", 120)
+                        bridge.control(target, "!BOOT")
+                    if bridge.wait_for(target, "!READY", 1200):
+                        bridge.note("firmware up")
+                        return True
+                    bridge.note("firmware did not come up", kind="error")
+                    return False
+
                 def attest():
                     import time as _t
+
+                    # probe_version() already sent GET_VERSION and the
+                    # responder has moved past that state, so starting the
+                    # flow with it again just gets ignored.
+                    booted = ensure_firmware()
+                    if not booted:
+                        return
+                    skip_first = getattr(bridge, "_version_probed", False)
 
                     state = {}
                     build = (protocol.build_frame_raw
@@ -339,10 +420,30 @@ def make_handler(bridge: Bridge):
                              else protocol.build_frame)
                     ver = 0x10
 
-                    for code, body_fn, want, name in protocol.ATTESTATION_FLOW:
+                    flow = protocol.ATTESTATION_FLOW
+                    if skip_first:
+                        ver = bridge.negotiated_version
+                        flow = flow[1:]
+                        bridge.note(f"version already negotiated - "
+                                    f"continuing at 1.{ver & 0xF}")
+                    for code, body_fn, want, name in flow:
                         body = body_fn()
+                        if code in (0x83, 0xE0) and ver >= 0x13:
+                            body += bytes(8)   # SPDM 1.3 RequesterContext
                         bridge.send(target, build(code, body, spdm_version=ver))
-                        rsp = bridge.wait_response(want, timeout=25)
+                        rsp = bridge.wait_response(want, timeout=120 if code in (0x83, 0xE0) else 25)
+                        if rsp is not None and rsp.spdm_code == 0x7F:
+                            bridge.note(f"{name}: ERROR from responder - {rsp.summary()}", kind="error")
+                            break
+                        if rsp is None:
+                            # the MCU is sometimes busy long enough for a frame
+                            # to be dropped; one resend usually lands
+                            bridge.note(f"{name}: no response, resending")
+                            bridge.send(target, build(code, body, spdm_version=ver))
+                            rsp = bridge.wait_response(want, timeout=40)
+                        if rsp is not None and rsp.spdm_code == 0x7F:
+                            bridge.note(f"{name}: ERROR from responder - {rsp.summary()}", kind="error")
+                            break
                         if rsp is None:
                             bridge.note(f"{name}: no response - stopping",
                                         kind="error")
@@ -387,6 +488,18 @@ def make_handler(bridge: Bridge):
                     bridge.note(f"attestation run finished, {done} stage(s) "
                                 "returned data")
 
+                if getattr(bridge, '_attest_running', False):
+                    bridge.note('an attestation run is already in progress',
+                                kind='error')
+                    self._send(200, b'{"ok":false,"busy":true}')
+                    return
+                bridge._attest_running = True
+                _orig = attest
+                def attest():
+                    try:
+                        _orig()
+                    finally:
+                        bridge._attest_running = False
                 threading.Thread(target=attest, daemon=True).start()
                 self._send(200, b'{"ok":true}')
             elif url.path == "/api/sequence":

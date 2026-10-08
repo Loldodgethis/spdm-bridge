@@ -258,9 +258,20 @@ class Bridge:
             _t.sleep(0.2)
         return False
 
-    def send(self, target: str, data: bytes, label: str = "host") -> None:
-        """Put raw bytes on one endpoint, logging each frame inside them."""
+    def send(self, target: str, data: bytes, label: str = "host",
+             lead_flag: bool = True) -> None:
+        """Put raw bytes on one endpoint, logging each frame inside them.
+
+        An extra 0x7E is prepended by default. The agent's sequence counter
+        starts from whatever the register holds, so its very first byte can
+        collide with the number the MCU last saw and be ignored as a repeat.
+        If that byte is the opening flag the whole frame is lost. A duplicate
+        flag costs nothing - the receiver reads it as an empty frame - and
+        guarantees a real one arrives.
+        """
         ep = self.endpoints[target]
+        if lead_flag and data[:1] == b"\x7e":
+            data = b"\x7e" + data
         self.record_raw(target, "out", data)
         ep.send(data)
         self.counters["host"] += 1
@@ -287,7 +298,7 @@ class Bridge:
                     if e.seq <= seen:
                         continue
                     msg = self._responses.get(e.seq)
-                    if msg is not None and msg.spdm_code == code:
+                    if msg is not None and msg.spdm_code in (code, 0x7F):
                         return msg
             _t.sleep(0.05)
         return None
